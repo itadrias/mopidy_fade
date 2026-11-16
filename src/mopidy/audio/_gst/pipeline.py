@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from mopidy import exceptions
@@ -11,6 +13,7 @@ from mopidy._lib.gst import (
     from_gst_time,
     to_gst_time,
 )
+from mopidy.audio._gst.crossfade import calculate_gains
 from mopidy.audio._gst.types import (
     GstAsyncDone,
     GstBuffering,
@@ -137,6 +140,11 @@ class GstPlaybackPipeline:
         self._event_handler_id: int | None = None
         self._pad: Gst.Pad | None = None
 
+        self.crossfade_mixer: Gst.Element | None = None
+        self.crossfade_volume_a: Gst.Element | None = None
+        self.crossfade_volume_b: Gst.Element | None = None
+        self._demo_fade_started = False
+
         self.playbin = self._make_playbin(on_about_to_finish, on_source_setup)
         self._setup_message_handling(on_bus_message)
         self.output_bin = make_output_bin(self._config["audio"]["output"])
@@ -195,7 +203,95 @@ class GstPlaybackPipeline:
         audio_sink.add(self.output_bin)
         audio_sink.add(volume)
 
-        queue.link(volume)
+        if self._config["audio"]["crossfade_duration"] > 0:
+            fade_volume = Gst.ElementFactory.make(
+                "volume", "crossfade-volume-a"
+            )
+            audiomixer = Gst.ElementFactory.make(
+                "audiomixer", "crossfade-mixer"
+            )
+
+            if fade_volume is None or audiomixer is None:
+                raise exceptions.AudioException(
+                    "Failed to create crossfade elements."
+                )
+
+            audio_sink.add(fade_volume)
+            audio_sink.add(audiomixer)
+
+            if not queue.link(fade_volume):
+                raise exceptions.AudioException(
+                    "Failed to link crossfade volume."
+                )
+
+            if not fade_volume.link(audiomixer):
+                raise exceptions.AudioException(
+                    "Failed to link audiomixer input."
+                )
+
+            if not audiomixer.link(volume):
+                raise exceptions.AudioException(
+                    "Failed to link audiomixer output."
+                )
+                        # Temporary second-track test, not final crossfade logic.
+            source_b = Gst.ElementFactory.make("uridecodebin", "test-track-b")
+            queue_b = Gst.ElementFactory.make("queue", "test-queue-b")
+            convert_b = Gst.ElementFactory.make("audioconvert")
+            resample_b = Gst.ElementFactory.make("audioresample")
+            volume_b = Gst.ElementFactory.make("volume", "crossfade-volume-b")
+
+            elements = (
+                source_b, queue_b, convert_b, resample_b, volume_b
+            )
+            if any(element is None for element in elements):
+                raise exceptions.AudioException(
+                    "Failed to create second audio source."
+                )
+
+            source_b.set_property(
+                "uri", (Path.home() / "Music" / "song2.mp3").as_uri()
+            )
+            volume_b.set_property("volume", 0.0)
+
+            for element in elements:
+                audio_sink.add(element)
+
+            if not (
+                queue_b.link(convert_b)
+                and convert_b.link(resample_b)
+                and resample_b.link(volume_b)
+                and volume_b.link(audiomixer)
+            ):
+                raise exceptions.AudioException(
+                    "Failed to link second audio branch."
+                )
+
+            def on_b_pad_added(_source, pad):
+                caps = pad.get_current_caps()
+                if caps is None:
+                    return
+                if not caps.get_structure(0).get_name().startswith(
+                    "audio/x-raw"
+                ):
+                    return
+
+                sink_pad = queue_b.get_static_pad("sink")
+                if sink_pad is None or sink_pad.is_linked():
+                    return
+
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    logger.error("Failed to link second decoded audio pad.")
+
+            self._signals.connect(
+                source_b, "pad-added", on_b_pad_added
+            )
+
+            self.crossfade_mixer = audiomixer
+            self.crossfade_volume_a = fade_volume
+            self.crossfade_volume_b = volume_b
+        else:
+            queue.link(volume)
+
         volume.link(self.output_bin)
 
         queue_sink = queue.get_static_pad("sink")
@@ -208,6 +304,40 @@ class GstPlaybackPipeline:
         self.playbin.set_property("audio-sink", audio_sink)
 
         return queue, volume
+
+    def start_crossfade_demo(self) -> None:
+        """Test the gain curves on two already-running audio sources."""
+        if self._demo_fade_started:
+            return
+
+        if self.crossfade_volume_a is None:
+            return
+        if self.crossfade_volume_b is None:
+            return
+
+        duration = self._config["audio"]["crossfade_duration"]
+        if duration <= 0:
+            return
+
+        self._demo_fade_started = True
+        started_at = time.monotonic()
+        curve = self._config["audio"].get(
+            "crossfade_curve", "linear"
+        )
+
+        def update() -> bool:
+            progress = min(
+                (time.monotonic() - started_at) / duration,
+                1.0,
+            )
+            gain_a, gain_b = calculate_gains(progress, curve)
+
+            self.crossfade_volume_a.set_property("volume", gain_a)
+            self.crossfade_volume_b.set_property("volume", gain_b)
+
+            return progress < 1.0
+
+        GLib.timeout_add(100, update)
 
     def _setup_message_handling(
         self,

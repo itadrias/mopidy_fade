@@ -65,7 +65,9 @@ app_schemas: list[ConfigSchema | MapConfigSchema] = [
             "mixer_volume": types.Integer(optional=True, minimum=0, maximum=100),
             "output": types.String(),
             "buffer_time": types.Integer(optional=True, minimum=1),
-        },
+	    "crossfade_duration": types.Integer(minimum=0),
+	    "crossfade_curve": types.String(choices=("linear", "equal_power")),
+	},
     ),
     ConfigSchema(
         "proxy",

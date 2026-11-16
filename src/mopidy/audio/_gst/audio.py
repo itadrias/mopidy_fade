@@ -379,7 +379,10 @@ class GstAudio(Audio, pykka.ThreadingActor):
         assert self._pipeline
 
         self._target_state = GstState.PLAYING
-        return self._pipeline.set_state(GstState.PLAYING)
+        started = self._pipeline.set_state(GstState.PLAYING)
+        if started:
+            self._pipeline.start_crossfade_demo()
+        return started
 
     @override
     def pause_playback(self) -> bool:
