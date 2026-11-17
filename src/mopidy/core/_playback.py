@@ -64,6 +64,12 @@ class PlaybackController:
 
         if self._audio:
             self._audio.set_about_to_finish_callback(self._on_about_to_finish_callback)
+            self._audio.set_crossfade_prepare_callback(
+                self._on_crossfade_prepare_callback
+            )
+            self._audio.set_crossfade_handoff_callback(
+                self._on_crossfade_handoff_callback
+            )
 
     def get_current_tl_track(self) -> TlTrack | None:
         """Get the currently playing or selected track.
@@ -329,6 +335,86 @@ class PlaybackController:
                 kwargs={},
             ),
         )
+
+
+    def _on_crossfade_prepare_callback(self, fade_ms: int):
+        """Ask the Core actor for the next playable local track."""
+        return self.core.actor_ref.ask(
+            ProxyCall(
+                attr_path=("playback", "_get_crossfade_candidate"),
+                args=(fade_ms,),
+                kwargs={},
+            ),
+        )
+
+    def _get_crossfade_candidate(self, fade_ms: int):
+        """Do not modify the tracklist or current playback state yet."""
+        if self._state != PlaybackState.PLAYING:
+            return None
+
+        current = self._current_tl_track
+        if current is None or self._pending_tl_track is not None:
+            return None
+
+        next_track = self.core.tracklist._get_eot_tl_track(reference=current)
+        if next_track is None or next_track.tlid == current.tlid:
+            return None
+        if (
+            next_track.track.length is not None
+            and next_track.track.length <= fade_ms
+        ):
+            return None
+
+        backend = self._get_backend(tl_track=next_track)
+        if backend is None:
+            return None
+        try:
+            uri = backend.playback.translate_uri(next_track.track.uri).get()
+        except Exception:
+            logger.exception("Could not translate crossfade track URI")
+            return None
+
+        # Deliberate scope: local files with known durations only.
+        if not uri or not str(uri).startswith("file://"):
+            return None
+
+        return {
+            "tlid": next_track.tlid,
+            "uri": str(uri),
+            "duration_ms": next_track.track.length,
+        }
+
+    def _on_crossfade_handoff_callback(self, tlid: int) -> None:
+        """Queue the handoff, avoiding a deadlock against the audio actor."""
+        self.core.actor_ref.tell(
+            ProxyCall(
+                attr_path=("playback", "_on_crossfade_handoff"),
+                args=(tlid,),
+                kwargs={},
+            ),
+        )
+
+    def _on_crossfade_handoff(self, tlid: int) -> None:
+        """Make the audible dynamic source the current Mopidy track.
+
+        This intentionally invokes Core's existing track event handling. It
+        must run on the Core actor, never from GStreamer's streaming thread.
+        """
+        if self._state != PlaybackState.PLAYING:
+            return
+        current = self._current_tl_track
+        if current is None:
+            return
+        next_track = self.core.tracklist._get_eot_tl_track(reference=current)
+        if next_track is None or next_track.tlid != tlid:
+            logger.warning("Crossfade handoff ignored (tracklist changed)")
+            return
+
+        self._pending_tl_track = next_track
+        self._pending_state = PlaybackState.PLAYING
+        if current.track.length is not None:
+            self._last_position = DurationMs(current.track.length)
+        self._on_stream_changed(next_track.track.uri)
 
     def _on_about_to_finish(self) -> None:
         if self._state == PlaybackState.STOPPED:

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from mopidy import exceptions
@@ -143,7 +141,11 @@ class GstPlaybackPipeline:
         self.crossfade_mixer: Gst.Element | None = None
         self.crossfade_volume_a: Gst.Element | None = None
         self.crossfade_volume_b: Gst.Element | None = None
-        self._demo_fade_started = False
+        self._initial_fade_volume: Gst.Element | None = None
+        self._active_dynamic: dict | None = None
+        self._next_dynamic: dict | None = None
+        self._dynamic_index = 0
+        self._pause_snapshot: DurationMs | None = None
 
         self.playbin = self._make_playbin(on_about_to_finish, on_source_setup)
         self._setup_message_handling(on_bus_message)
@@ -203,7 +205,7 @@ class GstPlaybackPipeline:
         audio_sink.add(self.output_bin)
         audio_sink.add(volume)
 
-        if self._config["audio"]["crossfade_duration"] > 0:
+        if self._config["audio"].get("crossfade_duration", 0) > 0:
             fade_volume = Gst.ElementFactory.make(
                 "volume", "crossfade-volume-a"
             )
@@ -233,62 +235,10 @@ class GstPlaybackPipeline:
                 raise exceptions.AudioException(
                     "Failed to link audiomixer output."
                 )
-                        # Temporary second-track test, not final crossfade logic.
-            source_b = Gst.ElementFactory.make("uridecodebin", "test-track-b")
-            queue_b = Gst.ElementFactory.make("queue", "test-queue-b")
-            convert_b = Gst.ElementFactory.make("audioconvert")
-            resample_b = Gst.ElementFactory.make("audioresample")
-            volume_b = Gst.ElementFactory.make("volume", "crossfade-volume-b")
-
-            elements = (
-                source_b, queue_b, convert_b, resample_b, volume_b
-            )
-            if any(element is None for element in elements):
-                raise exceptions.AudioException(
-                    "Failed to create second audio source."
-                )
-
-            source_b.set_property(
-                "uri", (Path.home() / "Music" / "song2.mp3").as_uri()
-            )
-            volume_b.set_property("volume", 0.0)
-
-            for element in elements:
-                audio_sink.add(element)
-
-            if not (
-                queue_b.link(convert_b)
-                and convert_b.link(resample_b)
-                and resample_b.link(volume_b)
-                and volume_b.link(audiomixer)
-            ):
-                raise exceptions.AudioException(
-                    "Failed to link second audio branch."
-                )
-
-            def on_b_pad_added(_source, pad):
-                caps = pad.get_current_caps()
-                if caps is None:
-                    return
-                if not caps.get_structure(0).get_name().startswith(
-                    "audio/x-raw"
-                ):
-                    return
-
-                sink_pad = queue_b.get_static_pad("sink")
-                if sink_pad is None or sink_pad.is_linked():
-                    return
-
-                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
-                    logger.error("Failed to link second decoded audio pad.")
-
-            self._signals.connect(
-                source_b, "pad-added", on_b_pad_added
-            )
-
             self.crossfade_mixer = audiomixer
             self.crossfade_volume_a = fade_volume
-            self.crossfade_volume_b = volume_b
+            self._initial_fade_volume = fade_volume
+            self.crossfade_volume_b = None
         else:
             queue.link(volume)
 
@@ -304,40 +254,6 @@ class GstPlaybackPipeline:
         self.playbin.set_property("audio-sink", audio_sink)
 
         return queue, volume
-
-    def start_crossfade_demo(self) -> None:
-        """Test the gain curves on two already-running audio sources."""
-        if self._demo_fade_started:
-            return
-
-        if self.crossfade_volume_a is None:
-            return
-        if self.crossfade_volume_b is None:
-            return
-
-        duration = self._config["audio"]["crossfade_duration"]
-        if duration <= 0:
-            return
-
-        self._demo_fade_started = True
-        started_at = time.monotonic()
-        curve = self._config["audio"].get(
-            "crossfade_curve", "linear"
-        )
-
-        def update() -> bool:
-            progress = min(
-                (time.monotonic() - started_at) / duration,
-                1.0,
-            )
-            gain_a, gain_b = calculate_gains(progress, curve)
-
-            self.crossfade_volume_a.set_property("volume", gain_a)
-            self.crossfade_volume_b.set_property("volume", gain_b)
-
-            return progress < 1.0
-
-        GLib.timeout_add(100, update)
 
     def _setup_message_handling(
         self,
@@ -451,6 +367,209 @@ class GstPlaybackPipeline:
         )
         return from_gst_time(segment.position)
 
+
+    def _running_time_ns(self) -> int:
+        clock = self.playbin.get_clock()
+        if clock is None:
+            return 0
+        return max(0, int(clock.get_time() - self.playbin.get_base_time()))
+
+    @property
+    def has_dynamic_track(self) -> bool:
+        return self._active_dynamic is not None
+
+    @property
+    def has_crossfade_source(self) -> bool:
+        return self._next_dynamic is not None
+
+    @property
+    def next_source_elapsed_ms(self) -> int:
+        """Elapsed pipeline-running time since the overlap started."""
+        if self._next_dynamic is None:
+            return 0
+        return max(
+            0,
+            (self._running_time_ns() - self._next_dynamic["start_rt_ns"])
+            // Gst.MSECOND,
+        )
+
+    def _remove_dynamic(self, branch: dict) -> None:
+        """Remove a stopped, muted dynamic branch and its mixer input."""
+        elements = branch["elements"]
+        source = branch["source"]
+        try:
+            source.disconnect(branch["handler_id"])
+        except (TypeError, ValueError, RuntimeError):
+            pass
+
+        # Stop the source first so its streaming thread cannot push while
+        # pads are being detached. Dynamic graph manipulation is delicate.
+        for element in elements:
+            element.set_state(Gst.State.NULL)
+
+        source_pad = branch["volume"].get_static_pad("src")
+        peer = source_pad.get_peer() if source_pad is not None else None
+        if source_pad is not None and peer is not None:
+            source_pad.unlink(peer)
+            if self.crossfade_mixer is not None:
+                self.crossfade_mixer.release_request_pad(peer)
+
+        queue_sink = branch["queue"].get_static_pad("sink")
+        if queue_sink is not None and (peer_pad := queue_sink.get_peer()):
+            peer_pad.unlink(queue_sink)
+
+        audio_sink = branch["bin"]
+        for element in reversed(elements):
+            if element.get_parent() == audio_sink:
+                audio_sink.remove(element)
+
+    def cancel_pending_crossfade(self) -> None:
+        """Discard an uncommitted fade, e.g. after a manual seek."""
+        if self._next_dynamic is not None:
+            self._remove_dynamic(self._next_dynamic)
+            self._next_dynamic = None
+            self.crossfade_volume_b = None
+        if self.crossfade_volume_a is not None:
+            self.crossfade_volume_a.set_property("volume", 1.0)
+
+    def _reset_crossfade_sources(self) -> None:
+        self.cancel_pending_crossfade()
+        if self._active_dynamic is not None:
+            self._remove_dynamic(self._active_dynamic)
+            self._active_dynamic = None
+        self.crossfade_volume_a = self._initial_fade_volume
+        if self.crossfade_volume_a is not None:
+            self.crossfade_volume_a.set_property("volume", 1.0)
+        self._pause_snapshot = None
+
+    def start_crossfade_with_uri(self, uri: str, duration_ms: int | None) -> bool:
+        """Begin playing a candidate URI in the existing GStreamer mixer.
+
+        Only local, finite tracks are supported in this prototype.
+        """
+        if (
+            self.crossfade_mixer is None
+            or self.crossfade_volume_a is None
+            or self._next_dynamic is not None
+            or not uri.startswith("file://")
+            or (duration_ms is not None and duration_ms <= 0)
+        ):
+            return False
+
+        audio_sink = self.crossfade_mixer.get_parent()
+        if audio_sink is None or self.playbin.get_clock() is None:
+            return False
+
+        self._dynamic_index += 1
+        suffix = str(self._dynamic_index)
+        source = Gst.ElementFactory.make("uridecodebin", f"xf-source-{suffix}")
+        queue = Gst.ElementFactory.make("queue", f"xf-queue-{suffix}")
+        convert = Gst.ElementFactory.make("audioconvert")
+        resample = Gst.ElementFactory.make("audioresample")
+        volume = Gst.ElementFactory.make("volume", f"xf-volume-{suffix}")
+        elements = (source, queue, convert, resample, volume)
+        if any(element is None for element in elements):
+            raise exceptions.AudioException("Cannot create crossfade decoder")
+
+        source.set_property("uri", uri)
+        volume.set_property("volume", 0.0)
+        start_rt_ns = self._running_time_ns()
+        added = []
+        try:
+            for element in elements:
+                audio_sink.add(element)
+                added.append(element)
+            if not (
+                queue.link(convert)
+                and convert.link(resample)
+                and resample.link(volume)
+                and volume.link(self.crossfade_mixer)
+            ):
+                raise exceptions.AudioException("Cannot link crossfade decoder")
+
+            volume_src = volume.get_static_pad("src")
+            if volume_src is None:
+                raise exceptions.AudioException("Missing crossfade volume pad")
+            volume_src.set_offset(start_rt_ns)
+        except Exception:
+            for element in added:
+                element.set_state(Gst.State.NULL)
+            pad = volume.get_static_pad("src")
+            peer = pad.get_peer() if pad is not None else None
+            if pad is not None and peer is not None:
+                pad.unlink(peer)
+                self.crossfade_mixer.release_request_pad(peer)
+            for element in reversed(added):
+                audio_sink.remove(element)
+            raise
+
+        def on_pad_added(_element: Gst.Element, pad: Gst.Pad) -> None:
+            caps = pad.get_current_caps() or pad.query_caps(None)
+            if caps is None or caps.get_size() == 0:
+                return
+            if not caps.get_structure(0).get_name().startswith("audio/x-raw"):
+                return
+            queue_sink = queue.get_static_pad("sink")
+            if queue_sink is not None and not queue_sink.is_linked():
+                result = pad.link(queue_sink)
+                if result != Gst.PadLinkReturn.OK:
+                    logger.error("Crossfade decoder pad link failed: %s", result)
+
+        handler_id = source.connect("pad-added", on_pad_added)
+        branch = {
+            "elements": elements,
+            "source": source,
+            "queue": queue,
+            "volume": volume,
+            "bin": audio_sink,
+            "handler_id": handler_id,
+            "start_rt_ns": start_rt_ns,
+            "duration_ms": duration_ms,
+            "seek_base_ms": 0,
+        }
+        self._next_dynamic = branch
+        self.crossfade_volume_b = volume
+
+        for element in reversed(elements):
+            if not element.sync_state_with_parent():
+                self.cancel_pending_crossfade()
+                raise exceptions.AudioException("Cannot activate crossfade decoder")
+
+        logger.info("Dynamic crossfade source started: %s", uri)
+        return True
+
+    def update_crossfade(self, progress: float) -> None:
+        """Apply the selected gain curve to both active audio branches."""
+        if self.crossfade_volume_a is None or self.crossfade_volume_b is None:
+            return
+        a, b = calculate_gains(
+            max(0.0, min(1.0, progress)),
+            self._config["audio"].get("crossfade_curve", "linear"),
+        )
+        self.crossfade_volume_a.set_property("volume", a)
+        self.crossfade_volume_b.set_property("volume", b)
+
+    def promote_crossfade(self) -> bool:
+        """The faded-in source now provides the current track's audio.
+
+        The underlying playbin remains the clock owner. Track identity is
+        updated separately by the Core actor after this returns.
+        """
+        if self._next_dynamic is None:
+            return False
+        old_dynamic = self._active_dynamic
+        if self.crossfade_volume_a is not None:
+            self.crossfade_volume_a.set_property("volume", 0.0)
+        self.crossfade_volume_b.set_property("volume", 1.0)
+        self.crossfade_volume_a = self.crossfade_volume_b
+        self.crossfade_volume_b = None
+        self._active_dynamic = self._next_dynamic
+        self._next_dynamic = None
+        self._pause_snapshot = None
+        if old_dynamic is not None:
+            self._remove_dynamic(old_dynamic)
+        return True
+
     def set_uri(self, uri: str, *, download: bool = False) -> None:
         """Set the URI to play, and the buffering flags to use for it."""
         flags = GstPlayFlags.AUDIO
@@ -466,7 +585,13 @@ class GstPlaybackPipeline:
 
         Returns `True` if successful, else `False`.
         """
+        if state == GstState.PAUSED and self._active_dynamic is not None:
+            self._pause_snapshot = self.get_position()
         result = self.playbin.set_state(state.value)
+        if state in (GstState.NULL, GstState.READY):
+            self._reset_crossfade_sources()
+        elif state == GstState.PLAYING:
+            self._pause_snapshot = None
         gst_logger.debug(
             "Changing state to %s: result=%s",
             state.name,
@@ -481,7 +606,17 @@ class GstPlaybackPipeline:
         return True
 
     def get_position(self) -> DurationMs:
-        """Get the position of the playbin in milliseconds."""
+        """Return the time position of the currently audible source."""
+        if self._active_dynamic is not None:
+            if self._pause_snapshot is not None:
+                return self._pause_snapshot
+            active = self._active_dynamic
+            ms = active["seek_base_ms"] + max(
+                0,
+                (self._running_time_ns() - active["start_rt_ns"])
+                // Gst.MSECOND,
+            )
+            return DurationMs(int(ms))
         success, position = self.playbin.query_position(Gst.Format.TIME)
 
         if not success:
@@ -492,19 +627,67 @@ class GstPlaybackPipeline:
 
         return from_gst_time(position)
 
+    def get_duration(self) -> DurationMs | None:
+        """Return the active source duration, if available."""
+        if self._active_dynamic is not None:
+            active = self._active_dynamic
+            if active["duration_ms"] is not None:
+                return DurationMs(active["duration_ms"])
+            # Tracklist entries added from file:// URIs do not always have
+            # populated length metadata. Ask the active decoder if possible.
+            ok, value = active["source"].query_duration(Gst.Format.TIME)
+            if ok and value != Gst.CLOCK_TIME_NONE and value > 0:
+                active["duration_ms"] = int(value // Gst.MSECOND)
+                return DurationMs(active["duration_ms"])
+            return None
+        success, duration = self.playbin.query_duration(Gst.Format.TIME)
+
+        if not success or duration == Gst.CLOCK_TIME_NONE:
+            return None
+
+        return from_gst_time(duration)
+
     def seek(self, position: DurationMs) -> bool:
-        """Seek to a position in milliseconds."""
-        # TODO: double check seek flags in use.
+        """Seek the currently audible track rather than a retired source."""
+        self.cancel_pending_crossfade()
         gst_position = to_gst_time(position)
         gst_logger.debug("Sending flushing seek: position=%r", gst_position)
-        # Send seek event to the queue not the playbin. The default behavior
-        # for bins is to forward this event to all sinks, which results in
-        # duplicate seek events. Since elements are not allowed to act on the
-        # seek event, only modify it, this should be safe to do.
-        return self.queue.seek_simple(
-            Gst.Format.TIME,
-            Gst.SeekFlags.FLUSH,
-            gst_position,
+
+        if self._active_dynamic is not None:
+            # Direct the seek into the dynamic track, not the retired playbin.
+            active = self._active_dynamic
+            now = self._running_time_ns()
+            source_pad = active["volume"].get_static_pad("src")
+            if source_pad is None:
+                return False
+
+            # A pad offset adjusts running time, not file position.
+            # Prepare the new segment before issuing a flushing seek.
+            previous_offset = source_pad.get_offset()
+            source_pad.set_offset(now)
+
+            if not active["volume"].seek_simple(
+                Gst.Format.TIME, Gst.SeekFlags.FLUSH, gst_position
+            ):
+                source_pad.set_offset(previous_offset)
+                return False
+
+            active["seek_base_ms"] = int(position)
+            active["start_rt_ns"] = now
+            self._pause_snapshot = (
+                DurationMs(position) if self._pause_snapshot is not None else None
+            )
+            return True
+
+        # The main playbin handles a mixer-based graph correctly, while
+        # the original queue target remains right for the normal mode.
+        target = (
+            self.playbin
+            if self._config["audio"].get("crossfade_duration", 0) > 0
+            else self.queue
+        )
+        return target.seek_simple(
+            Gst.Format.TIME, Gst.SeekFlags.FLUSH, gst_position
         )
 
     def debug_to_dot_file(self, file_name: str) -> None:
@@ -529,3 +712,4 @@ class GstPlaybackPipeline:
 
         self._signals.disconnect_all()
         self.playbin.set_state(Gst.State.NULL)
+        self._reset_crossfade_sources()

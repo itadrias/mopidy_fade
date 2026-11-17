@@ -21,3 +21,43 @@ def calculate_gains(
 
     else:
         raise ValueError(f"Unsupported curve: {curve}")
+
+def should_start_crossfade(
+    position_ms: int,
+    duration_ms: int | None,
+    crossfade_seconds: int,
+    has_next_track: bool,
+) -> bool:
+
+    if crossfade_seconds <= 0:
+        return False
+
+    if not has_next_track or duration_ms is None:
+        return False
+
+    crossfade_ms = crossfade_seconds * 1000
+
+    if duration_ms <= crossfade_ms:
+        return False
+
+    remaining_ms = duration_ms - position_ms
+
+    return 0 < remaining_ms <= crossfade_ms
+
+
+def should_ignore_spurious_eos(
+    position_ms: int,
+    duration_ms: int | None,
+    has_dynamic_track: bool,
+    has_pending_crossfade: bool,
+    tolerance_ms: int = 1000,
+) -> bool:
+    """Ignore a retired playbin EOS while a newer source is still playing.
+
+    An EOS after the actual current song finishes should not be hidden.
+    """
+    if has_pending_crossfade:
+        return True
+    if not has_dynamic_track or duration_ms is None:
+        return False
+    return position_ms + tolerance_ms < duration_ms

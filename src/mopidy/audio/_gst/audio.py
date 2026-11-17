@@ -13,6 +13,10 @@ from mopidy._lib import logs, process
 from mopidy._lib.gi import GLib, Gst, GstBase, GstPbutils
 from mopidy._lib.gst import repr_tags, setup_proxy
 from mopidy.audio._api import Audio
+from mopidy.audio._gst.crossfade import (
+    should_ignore_spurious_eos,
+    should_start_crossfade,
+)
 from mopidy.audio._gst.mixer import GstSoftwareMixerAdapter
 from mopidy.audio._gst.pipeline import GstPlaybackPipeline
 from mopidy.audio._gst.types import (
@@ -66,6 +70,13 @@ class GstAudio(Audio, pykka.ThreadingActor):
         self._pending_tags: GstTags | None = None
 
         self._pipeline: GstPlaybackPipeline | None = None
+        self._crossfade_timer_id: int | None = None
+        self._crossfade_window_detected = False
+        self._crossfade_last_position = None
+        self._crossfade_candidate = None
+        self._crossfade_generation = 0
+        self._crossfade_handoff_callback = None
+        self._crossfade_prepare_callback = None
         self._about_to_finish_callback: Callable | None = None
         self._source_setup_callback: Callable | None = None
 
@@ -85,6 +96,11 @@ class GstAudio(Audio, pykka.ThreadingActor):
                 on_about_to_finish=self._on_gst_about_to_finish,
                 on_source_setup=self._on_gst_source_setup,
             )
+            if self._config["audio"].get("crossfade_duration", 0) > 0:
+                self._crossfade_timer_id = GLib.timeout_add(
+                    100,
+                    self._request_crossfade_tick,
+                )
             if self.mixer:
                 self.mixer.setup(self._pipeline.volume, self.actor_ref.proxy().mixer)
         except (GLib.Error, exceptions.AudioException):
@@ -95,6 +111,9 @@ class GstAudio(Audio, pykka.ThreadingActor):
     def on_stop(self) -> None:
         if self.mixer:
             self.mixer.teardown()
+        if self._crossfade_timer_id is not None:
+            GLib.source_remove(self._crossfade_timer_id)
+            self._crossfade_timer_id = None
         if self._pipeline is not None:
             self._pipeline.teardown()
 
@@ -112,6 +131,13 @@ class GstAudio(Audio, pykka.ThreadingActor):
             return
 
         gst_logger.debug("Got about-to-finish event.")
+        if self._pipeline and (
+            self._pipeline.has_crossfade_source
+            or self._pipeline.has_dynamic_track
+        ):
+            # B is already playing on the mixer's dynamic branch. Passing
+            # about-to-finish to Core would start another copy on playbin.
+            return
         if self._about_to_finish_callback:
             logger.debug("Running about-to-finish callback.")
             self._about_to_finish_callback()
@@ -146,6 +172,103 @@ class GstAudio(Audio, pykka.ThreadingActor):
             # The pipeline outlives the actor for a moment at teardown.
             gst_logger.debug("Dropped bus message, the audio actor is gone.")
 
+    def _request_crossfade_tick(self) -> bool:
+        try:
+            self.actor_ref.tell("crossfade-tick")
+        except pykka.ActorDeadError:
+            return False
+        return True
+
+    def set_crossfade_prepare_callback(self, callback: Callable) -> None:
+        self._crossfade_prepare_callback = callback
+
+    def set_crossfade_handoff_callback(self, callback: Callable) -> None:
+        self._crossfade_handoff_callback = callback
+
+    def _request_crossfade_candidate(self, generation: int) -> bool:
+        """Run a blocking Core query from the GLib thread, not GstAudio."""
+        if self._crossfade_prepare_callback is None:
+            return False
+        try:
+            fade_ms = self._config["audio"].get("crossfade_duration", 0) * 1000
+            candidate = self._crossfade_prepare_callback(fade_ms)
+            if candidate is not None:
+                self.actor_ref.tell(("crossfade-candidate", generation, candidate))
+            else:
+                logger.warning(
+                    "Crossfade candidate unavailable; no eligible next track "
+                    "or Core is no longer playing (generation=%s)", generation
+                )
+        except pykka.ActorDeadError:
+            pass
+        except Exception:
+            logger.exception("Could not prepare crossfade candidate")
+        return False
+
+    def _reset_crossfade_tracking(self) -> None:
+        self._crossfade_generation += 1
+        self._crossfade_candidate = None
+        self._crossfade_window_detected = False
+        self._crossfade_last_position = None
+
+    def _handle_crossfade_tick(self) -> None:
+        if self._pipeline is None or self._target_state != GstState.PLAYING:
+            return
+
+        position = self._pipeline.get_position()
+        duration = self._pipeline.get_duration()
+        if duration is None:
+            return
+
+        fade_ms = self._config["audio"].get("crossfade_duration", 0) * 1000
+        if self._pipeline.has_crossfade_source:
+            progress = (position - (duration - fade_ms)) / fade_ms
+            self._pipeline.update_crossfade(progress)
+
+            # Promote once the fade has reached the track end. Allow a
+            # single timer interval's tolerance for coarse duration metadata.
+            if (
+                position >= duration - 150
+                or self._pipeline.next_source_elapsed_ms >= fade_ms
+            ):
+                candidate = self._crossfade_candidate
+                if candidate is not None and self._pipeline.promote_crossfade():
+                    logger.info(
+                        "Crossfade handoff: TLID=%s, new position=%s",
+                        candidate["tlid"], self._pipeline.get_position(),
+                    )
+                    self._reset_crossfade_tracking()
+                    callback = self._crossfade_handoff_callback
+                    if callback is not None:
+                        # The callback only queues a Core actor message. It
+                        # must not synchronously ask Core from GstAudio.
+                        callback(candidate["tlid"])
+                return
+
+        if (
+            self._crossfade_last_position is not None
+            and position < self._crossfade_last_position - 1500
+        ):
+            self._crossfade_window_detected = False
+        self._crossfade_last_position = position
+        if self._crossfade_window_detected:
+            return
+
+        if should_start_crossfade(
+            position_ms=position,
+            duration_ms=duration,
+            crossfade_seconds=self._config["audio"].get("crossfade_duration", 0),
+            has_next_track=True,
+        ):
+            self._crossfade_window_detected = True
+            logger.info(
+                "Crossfade window reached: position=%s, duration=%s",
+                position, duration,
+            )
+            GLib.idle_add(
+                self._request_crossfade_candidate, self._crossfade_generation
+            )
+
     @override
     def on_receive(self, message: Any) -> None:
         match message:
@@ -167,6 +290,30 @@ class GstAudio(Audio, pykka.ThreadingActor):
                 self._on_gst_tag(tags)
             case GstWarning(error, debug):
                 self._on_gst_warning(error, debug)
+            case "crossfade-tick":
+                self._handle_crossfade_tick()
+            case ("crossfade-candidate", generation, candidate):
+                if (
+                    generation != self._crossfade_generation
+                    or self._target_state != GstState.PLAYING
+                    or self._pipeline is None
+                ):
+                    return
+                try:
+                    ok = self._pipeline.start_crossfade_with_uri(
+                        candidate["uri"], candidate["duration_ms"]
+                    )
+                except Exception:
+                    logger.exception("Failed to start crossfade source")
+                    return
+                if ok:
+                    self._crossfade_candidate = candidate
+                    logger.info(
+                        "Crossfade candidate: TLID=%s URI=%s",
+                        candidate["tlid"], candidate["uri"],
+                    )
+                else:
+                    logger.warning("Crossfade source was not started")
 
     def _on_gst_state_changed(
         self,
@@ -193,6 +340,20 @@ class GstAudio(Audio, pykka.ThreadingActor):
 
         if (new_playback_state := new_state.playback_state) is None:
             return  # READY is GStreamer specific, Mopidy has no such state.
+
+        # The underlying playbin still owns the pipeline after a handoff.
+        # It can report a stopped state for its retired source while a dynamic
+        # source is the current audible track. Never forward that stale event.
+        if (
+            new_playback_state == PlaybackState.STOPPED
+            and self._target_state == GstState.PLAYING
+            and self._is_retired_playbin_event()
+        ):
+            logger.warning(
+                "Ignoring retired playbin STOPPED while the dynamic track "
+                "is still audible"
+            )
+            return
 
         old_playback_state, self.state = self.state, new_playback_state
 
@@ -245,8 +406,34 @@ class GstAudio(Audio, pykka.ThreadingActor):
 
         gst_logger.log(level, "Got BUFFERING bus message: percent=%d%%", percent)
 
+    def _is_retired_playbin_event(self) -> bool:
+        """Check whether an EOS/STOP predates the audible dynamic track end."""
+        if self._pipeline is None:
+            return False
+        if not (
+            self._pipeline.has_dynamic_track
+            or self._pipeline.has_crossfade_source
+        ):
+            return False
+        return should_ignore_spurious_eos(
+            position_ms=self._pipeline.get_position(),
+            duration_ms=self._pipeline.get_duration(),
+            has_dynamic_track=self._pipeline.has_dynamic_track,
+            has_pending_crossfade=self._pipeline.has_crossfade_source,
+        )
+
     def _on_gst_end_of_stream(self) -> None:
         gst_logger.debug("Got EOS (end of stream) bus message.")
+        if self._target_state == GstState.PLAYING and self._is_retired_playbin_event():
+            assert self._pipeline is not None
+            logger.warning(
+                "Ignoring premature EOS from playbin; active position=%s "
+                "duration=%s, pending_crossfade=%s",
+                self._pipeline.get_position(),
+                self._pipeline.get_duration(),
+                self._pipeline.has_crossfade_source,
+            )
+            return
         logger.debug("Audio event: reached_end_of_stream()")
         self._tags = {}
         AudioListener.send("reached_end_of_stream")
@@ -339,7 +526,7 @@ class GstAudio(Audio, pykka.ThreadingActor):
                 "Ambiguous buffering flags: "
                 "'live_stream' and 'download' should not both be set.",
             )
-
+        self._reset_crossfade_tracking()
         self._pending_uri = uri
         self._pending_tags = {}
         self._live_stream = live_stream
@@ -371,8 +558,15 @@ class GstAudio(Audio, pykka.ThreadingActor):
     @override
     def set_position(self, position: DurationMs) -> bool:
         assert self._pipeline
-
-        return self._pipeline.seek(position)
+        self._reset_crossfade_tracking()
+        dynamic = self._pipeline.has_dynamic_track
+        success = self._pipeline.seek(position)
+        if success and dynamic:
+            # The output-bin SEGMENT probe only observes playbin's source.
+            # A seek in the promoted branch otherwise leaves Core's
+            # _pending_position frozen at the requested time forever.
+            self._on_gst_position(position)
+        return success
 
     @override
     def start_playback(self) -> bool:
@@ -380,8 +574,6 @@ class GstAudio(Audio, pykka.ThreadingActor):
 
         self._target_state = GstState.PLAYING
         started = self._pipeline.set_state(GstState.PLAYING)
-        if started:
-            self._pipeline.start_crossfade_demo()
         return started
 
     @override
@@ -400,6 +592,7 @@ class GstAudio(Audio, pykka.ThreadingActor):
         assert self._pipeline
 
         self._buffering = False
+        self._reset_crossfade_tracking()
         self._target_state = GstState.READY
         return self._pipeline.set_state(GstState.READY)
 
@@ -408,6 +601,7 @@ class GstAudio(Audio, pykka.ThreadingActor):
         assert self._pipeline
 
         self._buffering = False
+        self._reset_crossfade_tracking()
         self._target_state = GstState.NULL
         return self._pipeline.set_state(GstState.NULL)
 

@@ -17,6 +17,8 @@ def test_load_raw_config():
     assert config_loader.raw_config == {
         "audio": {
             "buffer_time": "",
+            "crossfade_duration": "0",
+            "crossfade_curve": "linear",
             "mixer": "software",
             "mixer_volume": "",
             "output": "autoaudiosink",
@@ -54,6 +56,8 @@ def test_validate_config():
     assert config_manager.config == {
         "audio": {
             "buffer_time": None,
+            "crossfade_duration": 0,
+            "crossfade_curve": "linear",
             "mixer": "software",
             "mixer_volume": None,
             "output": "autoaudiosink",
@@ -125,6 +129,8 @@ def test_format_config():
         "#mixer_volume = ",
         "#output = autoaudiosink",
         "#buffer_time = ",
+        "#crossfade_duration = 0",
+        "#crossfade_curve = linear",
         "",
         "[proxy]",
         "#scheme = ",

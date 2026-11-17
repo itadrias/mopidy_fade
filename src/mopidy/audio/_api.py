@@ -75,6 +75,14 @@ class Audio:
         """
         raise NotImplementedError
 
+    def set_crossfade_prepare_callback(self, callback: Callable[..., Any]) -> None:
+        """Register a Core callback for retrieving the next track metadata."""
+        raise NotImplementedError
+
+    def set_crossfade_handoff_callback(self, callback: Callable[[int], None]) -> None:
+        """Register a nonblocking callback for promoting the next track."""
+        raise NotImplementedError
+
     def get_position(self) -> DurationMs:
         """Get position in milliseconds."""
         raise NotImplementedError
@@ -140,6 +148,12 @@ class AudioProxy(ActorMemberMixin, pykka.ActorProxy[AudioActor]):
     set_uri = proxy_method(Audio.set_uri)
     set_source_setup_callback = proxy_method(Audio.set_source_setup_callback)
     set_about_to_finish_callback = proxy_method(Audio.set_about_to_finish_callback)
+    set_crossfade_prepare_callback = proxy_method(
+        Audio.set_crossfade_prepare_callback
+    )
+    set_crossfade_handoff_callback = proxy_method(
+        Audio.set_crossfade_handoff_callback
+    )
     get_position = proxy_method(Audio.get_position)
     set_position = proxy_method(Audio.set_position)
     start_playback = proxy_method(Audio.start_playback)
